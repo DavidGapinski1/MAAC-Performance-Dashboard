@@ -1,0 +1,14 @@
+# Data files — excluded to protect swimmer privacy
+data/
+*.csv
+*.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+*.env
+.env
+
+# OS
+.DS_Store
+Thumbs.db
