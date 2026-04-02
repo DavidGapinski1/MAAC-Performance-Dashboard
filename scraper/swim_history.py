@@ -1,140 +1,147 @@
 """
 MAAC Swim Club - Full Swim History Scraper
-Uses times_by_event endpoint to get every recorded swim per event per swimmer.
+Pulls every recorded swim per event per swimmer, including split times.
 
-Pipeline:
-  1. Load maac_best_times.csv (already scraped)
-  2. For each swimmer, loop through their recorded events
-  3. Hit /api/swimmers/{id}/times_by_event/?event={orgcode}|{distance}|{course}|{stroke}
-  4. Output every individual swim with splits
+Pipeline position:
+    maac_scraper.py → [swim_history.py] → build_tables.py
+
+Input:
+    ../data/maac_best_times.csv   (from maac_scraper.py)
+
+Output:
+    ../data/maac_swim_history.xlsx
+    ../data/maac_swim_history.csv
 
 Requirements:
     pip install requests pandas openpyxl python-dotenv
 
 Setup:
-    Create a .env file in the same folder with:
-    SWIMCLOUD_SESSION=your_session_cookie_here
+    Create scraper/.env with your SwimCloud session cookie:
+        SWIMCLOUD_SESSION=your_session_cookie_here
 
 Usage:
-    py -3.9 swim_history.py
+    cd scraper
+    python swim_history.py
 
-Output:
-    maac_swim_history.csv
-    maac_swim_history.xlsx
+Note:
+    This script makes ~1 API call per event per swimmer.
+    With 133 swimmers averaging ~15 events each, expect 30-60 minutes.
+    Do not run this unnecessarily — only needed when refreshing full history.
 """
 
 import os
 import time
-import requests
 import pandas as pd
 from dotenv import load_dotenv
+from curl_cffi import requests
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR   = os.path.join(SCRIPT_DIR, "..", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ── Config ────────────────────────────────────────────────────────────────────
 
 load_dotenv()
 SESSION_COOKIE = os.getenv("SWIMCLOUD_SESSION")
 
 if not SESSION_COOKIE:
-    raise ValueError("SWIMCLOUD_SESSION not found in .env file")
+    raise SystemExit(
+        "\n❌ SWIMCLOUD_SESSION not found in .env file.\n"
+        "   Create scraper/.env and add:\n"
+        "   SWIMCLOUD_SESSION=your_session_cookie_here\n"
+        "   (Log into swimcloud.com → F12 → Application → Cookies → copy sessionid)"
+    )
 
 BASE_URL = "https://www.swimcloud.com"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://www.swimcloud.com/",
-    "Accept": "application/json, text/plain, */*",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer":          "https://www.swimcloud.com/",
+    "Accept":           "application/json, text/plain, */*",
+    "Accept-Language":  "en-US,en;q=0.9",
     "X-Requested-With": "XMLHttpRequest",
 }
 
-# Reverse maps to get API codes from readable values
-STROKE_TO_CODE = {
-    "Free": "1",
-    "Back": "2",
-    "Breast": "3",
-    "Fly": "4",
-    "IM": "5",
-}
-
-COURSE_TO_CODE = {
-    "SCY": "Y",
-    "LCM": "L",
-}
-
-STROKE_MAP = {
-    "1": "Free",
-    "2": "Back",
-    "3": "Breast",
-    "4": "Fly",
-    "5": "IM",
-}
-
-COURSE_MAP = {
-    "Y": "SCY",
-    "L": "LCM",
-}
+STROKE_TO_CODE = {"Free": "1", "Back": "2", "Breast": "3", "Fly": "4", "IM": "5"}
+COURSE_TO_CODE = {"SCY": "Y", "LCM": "L"}
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
 
-def new_session():
-    s = requests.Session()
+def build_session():
+    s = requests.Session(impersonate="chrome124")
     s.headers.update(HEADERS)
+    s.cookies.set("sessionid", SESSION_COOKIE, domain="swimcloud.com")
     s.cookies.set("sessionid", SESSION_COOKIE, domain="www.swimcloud.com")
-    try:
-        s.get(BASE_URL, timeout=10)
-    except Exception:
-        pass
+    cf = os.getenv("SWIMCLOUD_CF_CLEARANCE")
+    if cf:
+        s.cookies.set("cf_clearance", cf, domain="swimcloud.com")
+        s.cookies.set("cf_clearance", cf, domain="www.swimcloud.com")
     return s
 
-session = new_session()
-request_count = 0
+SESSION = build_session()
 
-def api_get(url, retries=3):
-    global session, request_count
 
-    if request_count > 0 and request_count % 20 == 0:
-        print(f"\n  ♻ Refreshing session after {request_count} requests...")
-        session = new_session()
-        time.sleep(3)
-
+def get(url, retries=3):
+    """GET with retry. Exits immediately on 403."""
     for attempt in range(retries):
         try:
-            resp = session.get(url, timeout=15)
-            request_count += 1
+            resp = SESSION.get(url, timeout=15)
 
             if resp.status_code == 200:
                 return resp
-            elif resp.status_code == 429:
-                wait = 10 * (attempt + 1)
-                print(f"\n  ⚠ Rate limited (429) — waiting {wait}s...", end="")
-                time.sleep(wait)
+
             elif resp.status_code == 403:
-                print(f"\n  ⚠ 403 Forbidden — refreshing session...", end="")
-                session = new_session()
-                time.sleep(5)
+                raise SystemExit(
+                    "\n❌ 403 Forbidden — session cookie has expired.\n"
+                    "   Get a fresh one:\n"
+                    "     1. Log into swimcloud.com in Chrome\n"
+                    "     2. F12 → Application → Cookies → www.swimcloud.com\n"
+                    "     3. Copy 'sessionid' value into scraper/.env"
+                )
+
+            elif resp.status_code == 429:
+                wait = 20 * (attempt + 1)
+                print(f"\n  ⚠ Rate limited — waiting {wait}s...", end="", flush=True)
+                time.sleep(wait)
+
             else:
-                print(f"\n  ⚠ HTTP {resp.status_code}", end="")
-                time.sleep(2)
+                wait = 3 * (attempt + 1)
+                print(f"\n  ⚠ HTTP {resp.status_code} — retrying in {wait}s...", end="", flush=True)
+                time.sleep(wait)
+
+        except SystemExit:
+            raise
         except Exception as e:
-            print(f"\n  ⚠ Request error: {e}", end="")
-            time.sleep(3)
+            wait = 3 * (attempt + 1)
+            print(f"\n  ⚠ Error: {e} — retrying in {wait}s...", end="", flush=True)
+            time.sleep(wait)
 
     return None
 
 
-# ── Fetch all swims for one event ─────────────────────────────────────────────
+# ── Event history ─────────────────────────────────────────────────────────────
 
 def get_event_history(swimmer_id, name, gender, distance, stroke, course):
+    """Fetch all recorded swims for one swimmer/event combination."""
     stroke_code = STROKE_TO_CODE.get(stroke)
     course_code = COURSE_TO_CODE.get(course)
-
     if not stroke_code or not course_code:
         return []
 
-    # Event param format: orgcode|distance|course|stroke
     event_param = f"1|{distance}|{course_code}|{stroke_code}"
-    url = f"{BASE_URL}/api/swimmers/{swimmer_id}/times_by_event/?event={requests.utils.quote(event_param)}"
+    url = (
+        f"{BASE_URL}/api/swimmers/{swimmer_id}/times_by_event/"
+        f"?event={requests.utils.quote(event_param)}"
+    )
 
-    resp = api_get(url)
+    resp = get(url)
     if resp is None:
         return []
 
@@ -159,18 +166,12 @@ def get_event_history(swimmer_id, name, gender, distance, stroke, course):
             continue
 
         swim_time = str(entry.get("eventtime", "")).strip()
-        meet      = str(entry.get("name", "") or entry.get("meet_name", "")).strip()
-        date      = str(entry.get("dateofswim", "")).strip()
-        place     = str(entry.get("place", "")).strip()
-        heat      = entry.get("heat", "")
-        lane      = entry.get("lane", "")
+        if not swim_time or swim_time == "None":
+            continue
 
         split_data  = entry.get("split", {})
         splits_list = split_data.get("normalized_splittimes", []) if split_data else []
         splits      = ", ".join(str(s) for s in splits_list) if splits_list else ""
-
-        if not swim_time or swim_time == "None":
-            continue
 
         records.append({
             "name":       name,
@@ -180,11 +181,11 @@ def get_event_history(swimmer_id, name, gender, distance, stroke, course):
             "stroke":     stroke,
             "course":     course,
             "time":       swim_time,
-            "meet":       meet,
-            "date":       date,
-            "place":      place,
-            "heat":       heat,
-            "lane":       lane,
+            "meet":       str(entry.get("name", "") or entry.get("meet_name", "")).strip(),
+            "date":       str(entry.get("dateofswim", "")).strip(),
+            "place":      str(entry.get("place", "")).strip(),
+            "heat":       entry.get("heat", ""),
+            "lane":       entry.get("lane", ""),
             "splits":     splits,
         })
 
@@ -195,13 +196,20 @@ def get_event_history(swimmer_id, name, gender, distance, stroke, course):
 
 def export(all_records):
     df = pd.DataFrame(all_records)
-    df = df[["name", "gender", "swimmer_id", "distance", "stroke", "course",
-             "time", "meet", "date", "place", "heat", "lane", "splits"]]
-    df = df.sort_values(["gender", "name", "course", "distance", "stroke", "date"]).reset_index(drop=True)
+    df = df[[
+        "name", "gender", "swimmer_id", "distance", "stroke", "course",
+        "time", "meet", "date", "place", "heat", "lane", "splits"
+    ]]
+    df = df.sort_values(
+        ["gender", "name", "course", "distance", "stroke", "date"]
+    ).reset_index(drop=True)
 
-    df.to_csv("maac_swim_history.csv", index=False)
-    print(f"✅ CSV saved: maac_swim_history.csv")
+    # CSV
+    csv_path = os.path.join(DATA_DIR, "maac_swim_history.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"   ✅ data/maac_swim_history.csv — {len(df):,} records")
 
+    # Excel — times forced as text
     try:
         from openpyxl import Workbook
         wb = Workbook()
@@ -212,19 +220,22 @@ def export(all_records):
             ws.append(list(row))
 
         time_col = list(df.columns).index("time") + 1
-        for col in ws.iter_cols(min_col=time_col, max_col=time_col, min_row=2):
-            for c in col:
-                c.value = str(c.value)
-                c.number_format = "@"
+        for row in ws.iter_rows(min_row=2, min_col=time_col, max_col=time_col):
+            for cell in row:
+                cell.value         = str(cell.value)
+                cell.number_format = "@"
 
         for col in ws.columns:
-            width = max(len(str(cell.value or "")) for cell in col)
-            ws.column_dimensions[col[0].column_letter].width = min(width + 2, 40)
+            ws.column_dimensions[col[0].column_letter].width = min(
+                max(len(str(c.value or "")) for c in col) + 2, 40
+            )
 
-        wb.save("maac_swim_history.xlsx")
-        print(f"✅ Excel saved: maac_swim_history.xlsx (times as text)")
+        xlsx_path = os.path.join(DATA_DIR, "maac_swim_history.xlsx")
+        wb.save(xlsx_path)
+        print(f"   ✅ data/maac_swim_history.xlsx — times stored as text")
+
     except ImportError:
-        print("⚠ openpyxl not found — run: pip install openpyxl")
+        print("   ⚠ openpyxl not installed — run: pip install openpyxl")
 
     return df
 
@@ -232,31 +243,47 @@ def export(all_records):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Load best times CSV to know which events each swimmer has
-    try:
-        best_times = pd.read_csv("maac_best_times.csv")
-    except FileNotFoundError:
-        raise FileNotFoundError("maac_best_times.csv not found. Run maac_scraper.py first.")
+    print("=" * 55)
+    print("  MAAC SwimCloud Full Swim History Scraper")
+    print("=" * 55)
+    print("  ⚠  This script takes 30-60 minutes to complete.")
+    print("  ⚠  Only run when a full history refresh is needed.")
+    print("=" * 55)
 
-    # Get unique swimmers
-    swimmers = best_times[["name", "swimmer_id", "gender"]].drop_duplicates().to_dict("records")
-    print(f"Starting full swim history scraper...")
-    print(f"Found {len(swimmers)} swimmers in best times dataset")
+    # Load best times to know which events each swimmer has
+    best_times_path = os.path.join(DATA_DIR, "maac_best_times.csv")
+    if not os.path.exists(best_times_path):
+        raise SystemExit(
+            f"❌ data/maac_best_times.csv not found.\n"
+            f"   Run maac_scraper.py first."
+        )
 
-    all_records = []
+    best_times = pd.read_csv(best_times_path)
+    swimmers   = (
+        best_times[["name", "swimmer_id", "gender"]]
+        .drop_duplicates()
+        .to_dict("records")
+    )
+
+    print(f"\n📋 {len(swimmers)} swimmers | "
+          f"{len(best_times)} events total\n")
+
+    all_records  = []
     total_events = 0
 
-    for i, swimmer in enumerate(swimmers):
-        name       = swimmer["name"]
-        sid        = str(swimmer["swimmer_id"])
-        gender     = swimmer["gender"]
+    for i, swimmer in enumerate(swimmers, 1):
+        name   = swimmer["name"]
+        sid    = str(swimmer["swimmer_id"])
+        gender = swimmer["gender"]
 
-        # Get this swimmer's events from best times
-        swimmer_events = best_times[best_times["swimmer_id"] == int(sid)][["distance", "stroke", "course"]].drop_duplicates()
-        event_count = len(swimmer_events)
+        swimmer_events = best_times[
+            best_times["swimmer_id"] == int(sid)
+        ][["distance", "stroke", "course"]].drop_duplicates()
+
+        event_count   = len(swimmer_events)
         total_events += event_count
 
-        print(f"\n  [{i+1}/{len(swimmers)}] {name} ({gender}) — {event_count} events")
+        print(f"\n  [{i:>3}/{len(swimmers)}] {name} ({gender}) — {event_count} events")
 
         for _, event_row in swimmer_events.iterrows():
             distance = event_row["distance"]
@@ -273,16 +300,17 @@ def main():
             else:
                 print(f" no data")
 
-            time.sleep(1)
+            time.sleep(1.2)
 
-    print(f"\nTotal events scraped: {total_events}")
+    print(f"\n{'─' * 55}")
+    print(f"  Events scraped: {total_events}")
 
     if all_records:
+        print(f"\n💾 Saving output...")
         df = export(all_records)
-        print(f"Total swim records: {len(df)}")
-        print(df.head(20).to_string(index=False))
+        print(f"\n✅ Done — {len(df):,} swim records across {df['name'].nunique()} swimmers")
     else:
-        print("\n⚠ No records collected.")
+        print("⚠ No records collected — check your session cookie.")
 
 
 if __name__ == "__main__":
