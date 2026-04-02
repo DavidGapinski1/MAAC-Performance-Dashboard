@@ -4,9 +4,9 @@ A data pipeline and performance dashboard for MAAC Swim Club built with Python a
 
 ## Overview
 
-MAAC Swim Club is a competitive youth swim club based in Atlanta, GA. This project collects, structures, and visualizes performance data for all 133 swimmers on the 2025-26 roster across both short course (SCY) and long course (LCM) events.
+MAAC Swim Club is a competitive youth swim club based in Atlanta, GA. This project collects, structures, and visualizes performance data for all swimmers on the 2025-26 roster across both short course (SCY) and long course (LCM) events.
 
-The goal is to move coaching decisions from feel and memory to data — tracking individual progression, identifying each swimmer's strongest events, and surfacing team-wide trends heading into championship season.
+The goal is to move coaching decisions from feel and memory to data — tracking individual progression, identifying each swimmer's strongest events, surfacing team-wide trends heading into championship season, and benchmarking against national time standards.
 
 ## Project Structure
 
@@ -14,48 +14,77 @@ The goal is to move coaching decisions from feel and memory to data — tracking
 MAAC-Performance-Dashboard/
 ├── data/                    # Local data files (excluded from version control)
 ├── scraper/
-│   ├── maac_scraper.py      # Best times pipeline — 2,500+ records across 133 swimmers
-│   ├── swim_history.py      # Full swim history — 30,000+ swims with splits
-│   ├── build_tables.py      # Converts swim history into normalized CSV tables
-│   └── rankings.py          # Team rankings by event (coming soon)
-└── dashboard/               # Tableau dashboard (coming soon)
+│   ├── maac_scraper.py      # Step 1 — Best times: 2,500+ records across 132 swimmers
+│   ├── swim_history.py      # Step 2 — Full swim history: 35,000+ swims with splits
+│   ├── build_tables.py      # Step 3 — Normalized CSV tables for Tableau
+│   └── rankings.py          # Step 4 — Team rankings + time standard tiers
+└── dashboard/               # Tableau dashboard (in progress)
 ```
 
 ## Data Pipeline
 
-Performance data is sourced from SwimCloud via their internal API. The pipeline runs in three steps:
+Performance data is sourced from SwimCloud via their internal API. Run scripts from the `scraper/` directory in order.
 
-### Step 1 — Best Times
-Collects each swimmer's personal best per event across SCY and LCM.
+### Step 1 — Best Times (`maac_scraper.py`)
 
-```bash
-py -3.9 maac_scraper.py
-```
-
-Output: `maac_best_times.csv`
-
-### Step 2 — Full Swim History
-Uses the best times dataset to pull every recorded swim per event per swimmer, including split times.
-
-Requires a SwimCloud session cookie stored in a local `.env` file:
-```
-SWIMCLOUD_SESSION=your_session_cookie_here
-```
+Collects each swimmer's personal best per event (SCY + LCM). Tries to pull a live roster from SwimCloud; falls back to the local `swimmers.csv` if the roster page is blocked.
 
 ```bash
-py -3.9 swim_history.py
+cd scraper
+python maac_scraper.py
 ```
 
-Output: `maac_swim_history.xlsx`
+Output: `data/maac_best_times.csv`, `data/maac_best_times.xlsx`
 
-### Step 3 — Build Normalized Tables
-Converts the flat swim history file into three normalized CSV tables ready for Tableau.
+---
+
+### Step 2 — Full Swim History (`swim_history.py`)
+
+Uses the best times dataset to pull every recorded swim per event per swimmer, including split times. Makes ~1 API call per event per swimmer — expect 30–60 minutes for a full team run.
 
 ```bash
-py -3.9 build_tables.py
+cd scraper
+python swim_history.py
 ```
 
-Output: `swimmers.csv`, `swims.csv`, `splits.csv`
+Output: `data/maac_swim_history.csv`, `data/maac_swim_history.xlsx`
+
+---
+
+### Step 3 — Build Normalized Tables (`build_tables.py`)
+
+Converts the flat swim history file into three normalized CSV tables ready for Tableau. Optionally merges swimmer birthdates from a Commit roster export if `data/commit_roster.csv` is present.
+
+```bash
+cd scraper
+python build_tables.py
+```
+
+Output: `data/swimmers.csv`, `data/swims.csv`, `data/splits.csv`
+
+---
+
+### Step 4 — Rankings (`rankings.py`)
+
+Generates team rankings by event with time standard tier labels. Rankings are split by gender and course (SCY / LCM). Gap to #1 is reported in seconds.
+
+Standards tracked (in ascending difficulty):
+- GA State — age-group (10U / 11-12 / 13-14) and Senior, SCY + LCM
+- TYR Futures (18-under) — SCY + LCM
+- NCSA Spring — SCY + LCM
+- Speedo Winter Juniors — SCY + LCM
+- Speedo Junior Nationals — SCY + LCM
+- TYR Pro Swim — SCY + LCM
+- 2028 Olympic Trials A / B — LCM only
+
+```bash
+cd scraper
+python rankings.py
+```
+
+Output: `data/maac_rankings.csv`
+
+---
 
 ## Data Schema
 
@@ -65,12 +94,14 @@ Output: `swimmers.csv`, `swims.csv`, `splits.csv`
 | swimmer_id | SwimCloud swimmer ID |
 | name | Swimmer full name |
 | gender | men / women |
+| birthdate | Date of birth (populated if commit_roster.csv is present) |
 
 ### swims.csv
 | Field | Description |
 |---|---|
 | swim_id | Unique swim identifier |
 | swimmer_id | Foreign key → swimmers.csv |
+| gender | men / women |
 | distance | Event distance (50, 100, 200, etc.) |
 | stroke | Free, Back, Breast, Fly, IM |
 | course | SCY or LCM |
@@ -88,27 +119,50 @@ Output: `swimmers.csv`, `swims.csv`, `splits.csv`
 | split_number | Split order (1, 2, 3...) |
 | split_time | Cumulative split time |
 
+### maac_rankings.csv
+| Field | Description |
+|---|---|
+| rank | Team rank within event |
+| name | Swimmer name |
+| gender / course / distance / stroke | Event identifiers |
+| best_time | Personal best |
+| gap_to_1st | Seconds behind the team leader |
+| highest_standard | Highest time standard achieved |
+| GA Senior State, TYR Futures, ... | One column per standard (✓ or blank) |
+
 ### Tableau Relationships
 ```
-swims.swim_id      → splits.swim_id
-swims.swimmer_id   → swimmers.swimmer_id
+swims.swimmer_id                          → swimmers.swimmer_id
+swims.swim_id                             → splits.swim_id
+swims.gender + distance + stroke + course → cut_times (same fields)
 ```
 
 ## Setup
 
 **Requirements**
 ```bash
-pip install requests beautifulsoup4 pandas openpyxl python-dotenv
+pip install curl-cffi beautifulsoup4 pandas openpyxl python-dotenv
 ```
+
+> `curl-cffi` replaces `requests` to bypass Cloudflare's bot protection on SwimCloud.
+> It impersonates Chrome's TLS fingerprint so API calls go through correctly.
 
 **Environment**
 
-Create a `.env` file in the scraper folder:
+Create `scraper/.env`:
 ```
 SWIMCLOUD_SESSION=your_session_cookie_here
+SWIMCLOUD_CF_CLEARANCE=your_cf_clearance_cookie_here
 ```
 
-To get your session cookie: log into SwimCloud in Chrome → F12 → Application → Cookies → copy the `sessionid` value.
+To get both cookies:
+1. Log into swimcloud.com in Chrome
+2. F12 → Application → Cookies → www.swimcloud.com
+3. Copy the values of `sessionid` and `cf_clearance`
+
+**Optional — Birthdates**
+
+Drop a Commit roster export at `data/commit_roster.csv` before running `build_tables.py` to populate the `birthdate` column in `swimmers.csv`. The file is gitignored and never pushed to the repo.
 
 ## Status
 
@@ -117,7 +171,7 @@ To get your session cookie: log into SwimCloud in Chrome → F12 → Application
 | Best times scraper | Complete |
 | Full swim history scraper | Complete |
 | Normalized table builder | Complete |
-| Rankings scraper | Planned |
+| Rankings + time standards | Complete |
 | Tableau dashboard | In progress |
 
 ## Author
