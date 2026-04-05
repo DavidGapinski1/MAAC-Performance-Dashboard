@@ -24,9 +24,14 @@ Usage:
     python swim_history.py
 
 Note:
-    This script makes ~1 API call per event per swimmer.
-    With 133 swimmers averaging ~15 events each, expect 30-60 minutes.
+    This script makes ~1 API call per unique (distance, course) per swimmer.
+    With 132 swimmers averaging ~8 distance/course combos each, expect 15-30 minutes.
     Do not run this unnecessarily — only needed when refreshing full history.
+
+API note:
+    SwimCloud's times_by_event endpoint ignores the stroke parameter and returns
+    ALL swims at a given distance/course for a swimmer. Stroke is assigned by
+    matching each returned swim time to the swimmer's closest best time per stroke.
 """
 
 import os
@@ -69,7 +74,6 @@ HEADERS = {
 }
 
 STROKE_TO_CODE = {"Free": "1", "Back": "2", "Breast": "3", "Fly": "4", "IM": "5"}
-STROKE_MAP     = {"1": "Free", "2": "Back", "3": "Breast", "4": "Fly", "5": "IM"}
 COURSE_TO_CODE = {"SCY": "Y", "LCM": "L"}
 
 
@@ -127,16 +131,64 @@ def get(url, retries=3):
     return None
 
 
+# ── Time helpers ──────────────────────────────────────────────────────────────
+
+def time_to_seconds(t):
+    """Convert 'M:SS.ss' or 'SS.ss' string to float seconds. Returns None on failure."""
+    try:
+        s = str(t).strip()
+        if ":" in s:
+            m, sec = s.split(":", 1)
+            return float(m) * 60 + float(sec)
+        return float(s)
+    except Exception:
+        return None
+
+
+def assign_stroke(swim_time_str, stroke_bests):
+    """
+    Assign a stroke to a swim by finding which stroke's best time is closest.
+
+    stroke_bests: dict of {stroke: best_time_str}
+    Returns the stroke name, or None if no match can be made.
+
+    Because the SwimCloud times_by_event API ignores the stroke parameter and
+    returns all swims at a given distance/course, we use this heuristic to
+    recover the correct stroke label.
+    """
+    swim_secs = time_to_seconds(swim_time_str)
+    if swim_secs is None:
+        return None
+
+    best_stroke = None
+    min_diff    = float("inf")
+    for stroke, best_t in stroke_bests.items():
+        best_secs = time_to_seconds(best_t)
+        if best_secs is None:
+            continue
+        diff = abs(swim_secs - best_secs)
+        if diff < min_diff:
+            min_diff    = diff
+            best_stroke = stroke
+
+    return best_stroke
+
+
 # ── Event history ─────────────────────────────────────────────────────────────
 
-def get_event_history(swimmer_id, name, gender, distance, stroke, course):
-    """Fetch all recorded swims for one swimmer/event combination."""
-    stroke_code = STROKE_TO_CODE.get(stroke)
+def get_swims_for_distance_course(swimmer_id, distance, course):
+    """
+    Fetch all recorded swims for a swimmer at a given distance/course.
+
+    Note: the stroke code in the URL is ignored by the API; any valid code
+    returns the same full set of swims at that distance/course.
+    """
     course_code = COURSE_TO_CODE.get(course)
-    if not stroke_code or not course_code:
+    if not course_code:
         return []
 
-    event_param = f"1|{distance}|{course_code}|{stroke_code}"
+    # Stroke code in URL doesn't matter — use Free as the placeholder
+    event_param = f"1|{distance}|{course_code}|1"
     url = (
         f"{BASE_URL}/api/swimmers/{swimmer_id}/times_by_event/"
         f"?event={requests.utils.quote(event_param)}"
@@ -151,58 +203,13 @@ def get_event_history(swimmer_id, name, gender, distance, stroke, course):
     except Exception:
         return []
 
-    # Response may be a list or wrapped in a key
-    times_list = []
     if isinstance(data, list):
-        times_list = data
-    elif isinstance(data, dict):
+        return data
+    if isinstance(data, dict):
         for key in ["times", "results", "data", "swims"]:
             if key in data and isinstance(data[key], list):
-                times_list = data[key]
-                break
-
-    records = []
-    for entry in times_list:
-        if not isinstance(entry, dict):
-            continue
-
-        swim_time = str(entry.get("eventtime", "")).strip()
-        if not swim_time or swim_time == "None":
-            continue
-
-        # Validate stroke matches what we requested — API sometimes returns
-        # all strokes for a given distance, causing cross-stroke contamination
-        entry_stroke_code = str(entry.get("eventstroke", "")).strip()
-        entry_stroke      = STROKE_MAP.get(entry_stroke_code)
-        if entry_stroke and entry_stroke != stroke:
-            continue   # skip — this swim belongs to a different stroke
-
-        # Validate distance matches
-        entry_distance = entry.get("eventdistance")
-        if entry_distance is not None and str(entry_distance) != str(distance):
-            continue   # skip — different distance
-
-        split_data  = entry.get("split", {})
-        splits_list = split_data.get("normalized_splittimes", []) if split_data else []
-        splits      = ", ".join(str(s) for s in splits_list) if splits_list else ""
-
-        records.append({
-            "name":       name,
-            "gender":     gender,
-            "swimmer_id": swimmer_id,
-            "distance":   distance,
-            "stroke":     stroke,
-            "course":     course,
-            "time":       swim_time,
-            "meet":       str(entry.get("name", "") or entry.get("meet_name", "")).strip(),
-            "date":       str(entry.get("dateofswim", "")).strip(),
-            "place":      str(entry.get("place", "")).strip(),
-            "heat":       entry.get("heat", ""),
-            "lane":       entry.get("lane", ""),
-            "splits":     splits,
-        })
-
-    return records
+                return data[key]
+    return []
 
 
 # ── Export ────────────────────────────────────────────────────────────────────
@@ -259,7 +266,7 @@ def main():
     print("=" * 55)
     print("  MAAC SwimCloud Full Swim History Scraper")
     print("=" * 55)
-    print("  ⚠  This script takes 30-60 minutes to complete.")
+    print("  ⚠  This script takes 15-30 minutes to complete.")
     print("  ⚠  Only run when a full history refresh is needed.")
     print("=" * 55)
 
@@ -278,50 +285,114 @@ def main():
         .to_dict("records")
     )
 
+    # Build best-time lookup: {swimmer_id: {(distance, course): {stroke: best_time}}}
+    best_lookup = {}
+    for _, row in best_times.iterrows():
+        sid  = int(row["swimmer_id"])
+        key  = (row["distance"], row["course"])
+        best_lookup.setdefault(sid, {}).setdefault(key, {})[row["stroke"]] = row["best_time"]
+
     print(f"\n📋 {len(swimmers)} swimmers | "
           f"{len(best_times)} events total\n")
 
-    all_records  = []
-    total_events = 0
+    all_records   = []
+    total_api_calls = 0
 
     for i, swimmer in enumerate(swimmers, 1):
         name   = swimmer["name"]
-        sid    = str(swimmer["swimmer_id"])
+        sid    = int(swimmer["swimmer_id"])
         gender = swimmer["gender"]
 
-        swimmer_events = best_times[
-            best_times["swimmer_id"] == int(sid)
-        ][["distance", "stroke", "course"]].drop_duplicates()
+        # Get unique (distance, course) combos for this swimmer
+        dist_course_combos = (
+            best_times[best_times["swimmer_id"] == sid][["distance", "course"]]
+            .drop_duplicates()
+            .to_dict("records")
+        )
 
-        event_count   = len(swimmer_events)
-        total_events += event_count
+        stroke_bests_map = best_lookup.get(sid, {})
 
-        print(f"\n  [{i:>3}/{len(swimmers)}] {name} ({gender}) — {event_count} events")
+        print(f"\n  [{i:>3}/{len(swimmers)}] {name} ({gender}) "
+              f"— {len(dist_course_combos)} distance/course combos")
 
-        for _, event_row in swimmer_events.iterrows():
-            distance = event_row["distance"]
-            stroke   = event_row["stroke"]
-            course   = event_row["course"]
+        for combo in dist_course_combos:
+            distance = combo["distance"]
+            course   = combo["course"]
+            key      = (distance, course)
 
-            print(f"    {distance} {stroke} {course}...", end="", flush=True)
+            stroke_bests = stroke_bests_map.get(key, {})
+            stroke_list  = list(stroke_bests.keys())
 
-            records = get_event_history(sid, name, gender, distance, stroke, course)
+            label = f"{distance} {'/'.join(stroke_list)} {course}"
+            print(f"    {label}...", end="", flush=True)
 
-            if records:
-                print(f" {len(records)} swims")
-                all_records.extend(records)
-            else:
-                print(f" no data")
+            entries = get_swims_for_distance_course(str(sid), distance, course)
+            total_api_calls += 1
+
+            # Deduplicate entries by swim ID
+            seen_ids = set()
+            unique_entries = []
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                eid = e.get("id")
+                if eid and eid in seen_ids:
+                    continue
+                if eid:
+                    seen_ids.add(eid)
+                unique_entries.append(e)
+
+            count = 0
+            for entry in unique_entries:
+                swim_time = str(entry.get("eventtime", "")).strip()
+                if not swim_time or swim_time == "None":
+                    continue
+
+                # Assign stroke via time-matching against best times
+                if len(stroke_bests) == 1:
+                    stroke = stroke_list[0]
+                else:
+                    stroke = assign_stroke(swim_time, stroke_bests)
+                    if stroke is None:
+                        continue  # can't assign — skip
+
+                split_data  = entry.get("split", {})
+                splits_list = split_data.get("normalized_splittimes", []) if split_data else []
+                splits      = ", ".join(str(s) for s in splits_list) if splits_list else ""
+
+                all_records.append({
+                    "name":       name,
+                    "gender":     gender,
+                    "swimmer_id": sid,
+                    "distance":   distance,
+                    "stroke":     stroke,
+                    "course":     course,
+                    "time":       swim_time,
+                    "meet":       str(entry.get("name", "") or entry.get("meet_name", "")).strip(),
+                    "date":       str(entry.get("dateofswim", "")).strip(),
+                    "place":      str(entry.get("place", "")).strip(),
+                    "heat":       entry.get("heat", ""),
+                    "lane":       entry.get("lane", ""),
+                    "splits":     splits,
+                })
+                count += 1
+
+            print(f" {count} swims" if count else " no data")
 
             time.sleep(1.2)
 
     print(f"\n{'─' * 55}")
-    print(f"  Events scraped: {total_events}")
+    print(f"  API calls made: {total_api_calls}")
 
     if all_records:
         print(f"\n💾 Saving output...")
         df = export(all_records)
         print(f"\n✅ Done — {len(df):,} swim records across {df['name'].nunique()} swimmers")
+
+        # Stroke distribution summary
+        print(f"\nStroke distribution:")
+        for stroke, cnt in df["stroke"].value_counts().items():
+            print(f"  {stroke}: {cnt:,}")
     else:
         print("⚠ No records collected — check your session cookie.")
 
