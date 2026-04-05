@@ -31,9 +31,9 @@ Note:
 
 import os
 import time
-import requests
 import pandas as pd
 from dotenv import load_dotenv
+from curl_cffi import requests
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -76,10 +76,14 @@ COURSE_TO_CODE = {"SCY": "Y", "LCM": "L"}
 # ── Session ───────────────────────────────────────────────────────────────────
 
 def build_session():
-    s = requests.Session()
+    s = requests.Session(impersonate="chrome124")
     s.headers.update(HEADERS)
     s.cookies.set("sessionid", SESSION_COOKIE, domain="swimcloud.com")
     s.cookies.set("sessionid", SESSION_COOKIE, domain="www.swimcloud.com")
+    cf = os.getenv("SWIMCLOUD_CF_CLEARANCE")
+    if cf:
+        s.cookies.set("cf_clearance", cf, domain="swimcloud.com")
+        s.cookies.set("cf_clearance", cf, domain="www.swimcloud.com")
     return s
 
 SESSION = build_session()
