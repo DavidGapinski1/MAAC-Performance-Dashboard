@@ -31,9 +31,9 @@ Note:
 
 import os
 import time
+import requests
 import pandas as pd
 from dotenv import load_dotenv
-from curl_cffi import requests
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -69,20 +69,17 @@ HEADERS = {
 }
 
 STROKE_TO_CODE = {"Free": "1", "Back": "2", "Breast": "3", "Fly": "4", "IM": "5"}
+STROKE_MAP     = {"1": "Free", "2": "Back", "3": "Breast", "4": "Fly", "5": "IM"}
 COURSE_TO_CODE = {"SCY": "Y", "LCM": "L"}
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
 
 def build_session():
-    s = requests.Session(impersonate="chrome124")
+    s = requests.Session()
     s.headers.update(HEADERS)
     s.cookies.set("sessionid", SESSION_COOKIE, domain="swimcloud.com")
     s.cookies.set("sessionid", SESSION_COOKIE, domain="www.swimcloud.com")
-    cf = os.getenv("SWIMCLOUD_CF_CLEARANCE")
-    if cf:
-        s.cookies.set("cf_clearance", cf, domain="swimcloud.com")
-        s.cookies.set("cf_clearance", cf, domain="www.swimcloud.com")
     return s
 
 SESSION = build_session()
@@ -168,6 +165,18 @@ def get_event_history(swimmer_id, name, gender, distance, stroke, course):
         swim_time = str(entry.get("eventtime", "")).strip()
         if not swim_time or swim_time == "None":
             continue
+
+        # Validate stroke matches what we requested — API sometimes returns
+        # all strokes for a given distance, causing cross-stroke contamination
+        entry_stroke_code = str(entry.get("eventstroke", "")).strip()
+        entry_stroke      = STROKE_MAP.get(entry_stroke_code)
+        if entry_stroke and entry_stroke != stroke:
+            continue   # skip — this swim belongs to a different stroke
+
+        # Validate distance matches
+        entry_distance = entry.get("eventdistance")
+        if entry_distance is not None and str(entry_distance) != str(distance):
+            continue   # skip — different distance
 
         split_data  = entry.get("split", {})
         splits_list = split_data.get("normalized_splittimes", []) if split_data else []
