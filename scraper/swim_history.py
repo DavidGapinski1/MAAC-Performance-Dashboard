@@ -34,10 +34,12 @@ API note:
     matching each returned swim time to the swimmer's closest best time per stroke.
 """
 
+import sys
 import os
 import time
 import pandas as pd
 from dotenv import load_dotenv
+sys.stdout.reconfigure(encoding="utf-8")
 from curl_cffi import requests
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -74,7 +76,90 @@ HEADERS = {
 }
 
 STROKE_TO_CODE = {"Free": "1", "Back": "2", "Breast": "3", "Fly": "4", "IM": "5"}
-COURSE_TO_CODE = {"SCY": "Y", "LCM": "L"}
+COURSE_TO_CODE = {"SCY": "Y", "LCM": "L", "SCM": "S"}
+
+# Reverse map: API single-letter code → our course name (or None to discard)
+API_COURSE_TO_NAME  = {"Y": "SCY", "L": "LCM", "S": None, "M": None}
+TRACKED_COURSES     = {"SCY", "LCM"}
+
+# Reverse map: API eventstroke code → our stroke name
+API_STROKE_TO_NAME  = {"1": "Free", "2": "Back", "3": "Breast", "4": "Fly", "5": "IM"}
+
+# Approximate world records in seconds, keyed by (stroke, distance, course).
+# Used as a sanity floor — no college swimmer should be faster than these.
+# Times set slightly below actual WRs to avoid false positives on data entry quirks.
+_WR = {
+    # SCY men / women (same table — men's WRs used as absolute floor)
+    ("Free",   25,  "SCY"): 9.0,
+    ("Free",   50,  "SCY"): 17.0,
+    ("Free",  100,  "SCY"): 39.0,
+    ("Free",  200,  "SCY"): 86.0,
+    ("Free",  400,  "SCY"): 188.0,
+    ("Free",  500,  "SCY"): 235.0,
+    ("Free", 1000,  "SCY"): 480.0,
+    ("Free", 1650,  "SCY"): 800.0,
+    ("Back",   50,  "SCY"): 20.0,
+    ("Back",  100,  "SCY"): 43.0,
+    ("Back",  200,  "SCY"): 95.0,
+    ("Breast", 50,  "SCY"): 22.0,
+    ("Breast",100,  "SCY"): 49.0,
+    ("Breast",200,  "SCY"): 110.0,
+    ("Fly",    50,  "SCY"): 19.0,
+    ("Fly",   100,  "SCY"): 42.0,
+    ("Fly",   200,  "SCY"): 95.0,
+    ("IM",    100,  "SCY"): 46.0,
+    ("IM",    200,  "SCY"): 95.0,
+    ("IM",    400,  "SCY"): 200.0,
+    # LCM
+    ("Free",   50,  "LCM"): 20.0,
+    ("Free",  100,  "LCM"): 46.0,
+    ("Free",  200,  "LCM"): 102.0,
+    ("Free",  400,  "LCM"): 220.0,
+    ("Free",  800,  "LCM"): 455.0,
+    ("Free", 1500,  "LCM"): 860.0,
+    ("Back",   50,  "LCM"): 23.0,
+    ("Back",  100,  "LCM"): 51.0,
+    ("Back",  200,  "LCM"): 113.0,
+    ("Breast", 50,  "LCM"): 25.0,
+    ("Breast",100,  "LCM"): 56.0,
+    ("Breast",200,  "LCM"): 125.0,
+    ("Fly",    50,  "LCM"): 22.0,
+    ("Fly",   100,  "LCM"): 49.0,
+    ("Fly",   200,  "LCM"): 111.0,
+    ("IM",    200,  "LCM"): 113.0,
+    ("IM",    400,  "LCM"): 240.0,
+}
+# Ceiling multiplier: times slower than WR × this value are flagged as garbled
+WR_CEILING_MULTIPLIER = 4.0
+
+
+def validate_time(swim_secs, stroke, distance, course):
+    """
+    Check a swim time against world record bounds.
+    Returns (valid: bool, reason: str | None).
+    """
+    wr = _WR.get((stroke, distance, course))
+    if wr is None:
+        return True, None  # no reference for this event — pass through
+    if swim_secs < wr:
+        return False, f"faster than WR floor ({wr}s)"
+    if swim_secs > wr * WR_CEILING_MULTIPLIER:
+        return False, f"slower than {WR_CEILING_MULTIPLIER}× WR ({wr * WR_CEILING_MULTIPLIER:.1f}s)"
+    return True, None
+
+# Stroke assignment confidence thresholds.
+# Margin is measured as the difference in *percentage slower than best* between
+# the closest and second-closest stroke. Using percentage rather than raw seconds
+# accounts for swimmers improving over time — an old swim may be several seconds
+# from the current best, so absolute margins are unreliable.
+#
+# Example: if a swim is 8% slower than the Free best but 15% slower than the Back
+# best, the margin is 7pp. That's a confident Free assignment regardless of distance.
+#
+# Below SKIP_THRESHOLD   → too ambiguous to trust; record is dropped
+# Below FLAG_THRESHOLD   → kept but marked confidence="low" for review
+STROKE_SKIP_THRESHOLD = 3.0   # percentage points
+STROKE_FLAG_THRESHOLD = 10.0  # percentage points
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
@@ -150,7 +235,9 @@ def assign_stroke(swim_time_str, stroke_bests):
     Assign a stroke to a swim by finding which stroke's best time is closest.
 
     stroke_bests: dict of {stroke: best_time_str}
-    Returns the stroke name, or None if no match can be made.
+    Returns (stroke, margin) where margin is the gap in seconds between the
+    closest and second-closest stroke best time. margin=inf means only one
+    stroke candidate existed (unambiguous). Returns (None, None) on failure.
 
     Because the SwimCloud times_by_event API ignores the stroke parameter and
     returns all swims at a given distance/course, we use this heuristic to
@@ -158,37 +245,42 @@ def assign_stroke(swim_time_str, stroke_bests):
     """
     swim_secs = time_to_seconds(swim_time_str)
     if swim_secs is None:
-        return None
+        return None, None
 
-    best_stroke = None
-    min_diff    = float("inf")
+    # Score each stroke as % slower than its best time.
+    # A swim faster than the best is physically impossible for that stroke — exclude it.
+    diffs = []
     for stroke, best_t in stroke_bests.items():
         best_secs = time_to_seconds(best_t)
-        if best_secs is None:
+        if best_secs is None or best_secs <= 0:
             continue
-        diff = abs(swim_secs - best_secs)
-        if diff < min_diff:
-            min_diff    = diff
-            best_stroke = stroke
+        pct_slower = (swim_secs - best_secs) / best_secs * 100
+        if pct_slower < 0:
+            continue  # faster than current best — can't be this stroke
+        diffs.append((pct_slower, stroke))
 
-    return best_stroke
+    if not diffs:
+        return None, None
+
+    diffs.sort()
+    best_stroke = diffs[0][1]
+    margin = (diffs[1][0] - diffs[0][0]) if len(diffs) > 1 else float("inf")
+    return best_stroke, margin
 
 
 # ── Event history ─────────────────────────────────────────────────────────────
 
-def get_swims_for_distance_course(swimmer_id, distance, course):
+def get_swims_for_event(swimmer_id, stroke, distance, course):
     """
-    Fetch all recorded swims for a swimmer at a given distance/course.
-
-    Note: the stroke code in the URL is ignored by the API; any valid code
-    returns the same full set of swims at that distance/course.
+    Fetch all recorded swims for a swimmer at a specific stroke/distance/course.
+    The API filters by stroke code, so each stroke requires its own call.
     """
-    course_code = COURSE_TO_CODE.get(course)
-    if not course_code:
+    course_code  = COURSE_TO_CODE.get(course)
+    stroke_code  = STROKE_TO_CODE.get(stroke)
+    if not course_code or not stroke_code:
         return []
 
-    # Stroke code in URL doesn't matter — use Free as the placeholder
-    event_param = f"1|{distance}|{course_code}|1"
+    event_param = f"{stroke_code}|{distance}|{course_code}|1"
     url = (
         f"{BASE_URL}/api/swimmers/{swimmer_id}/times_by_event/"
         f"?event={requests.utils.quote(event_param)}"
@@ -218,7 +310,7 @@ def export(all_records):
     df = pd.DataFrame(all_records)
     df = df[[
         "name", "gender", "swimmer_id", "distance", "stroke", "course",
-        "time", "meet", "date", "place", "heat", "lane", "splits"
+        "time", "meet", "date", "place", "heat", "lane", "splits", "confidence"
     ]]
     df = df.sort_values(
         ["gender", "name", "course", "distance", "stroke", "date"]
@@ -227,7 +319,17 @@ def export(all_records):
     # CSV
     csv_path = os.path.join(DATA_DIR, "maac_swim_history.csv")
     df.to_csv(csv_path, index=False)
-    print(f"   ✅ data/maac_swim_history.csv — {len(df):,} records")
+    n_low  = (df["confidence"] == "low").sum()
+    n_high = (df["confidence"] == "high").sum()
+    print(f"   ✅ data/maac_swim_history.csv — {len(df):,} records "
+          f"({n_high:,} high-confidence, {n_low:,} low-confidence)")
+
+    # Flagged assignments report
+    flagged = df[df["confidence"] == "low"]
+    if not flagged.empty:
+        flag_path = os.path.join(DATA_DIR, "flagged_assignments.csv")
+        flagged.to_csv(flag_path, index=False)
+        print(f"   ⚠  data/flagged_assignments.csv — {len(flagged):,} low-confidence rows for review")
 
     # Excel — times forced as text
     try:
@@ -250,9 +352,18 @@ def export(all_records):
                 max(len(str(c.value or "")) for c in col) + 2, 40
             )
 
+        # Highlight low-confidence rows in yellow
+        from openpyxl.styles import PatternFill
+        yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        conf_col = list(df.columns).index("confidence") + 1
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            if row[conf_col - 1].value == "low":
+                for cell in row:
+                    cell.fill = yellow
+
         xlsx_path = os.path.join(DATA_DIR, "maac_swim_history.xlsx")
         wb.save(xlsx_path)
-        print(f"   ✅ data/maac_swim_history.xlsx — times stored as text")
+        print(f"   ✅ data/maac_swim_history.xlsx — low-confidence rows highlighted yellow")
 
     except ImportError:
         print("   ⚠ openpyxl not installed — run: pip install openpyxl")
@@ -295,27 +406,29 @@ def main():
     print(f"\n📋 {len(swimmers)} swimmers | "
           f"{len(best_times)} events total\n")
 
-    all_records   = []
+    all_records     = []
     total_api_calls = 0
+    total_skipped   = 0
 
     for i, swimmer in enumerate(swimmers, 1):
         name   = swimmer["name"]
         sid    = int(swimmer["swimmer_id"])
         gender = swimmer["gender"]
 
-        # Get unique (distance, course) combos for this swimmer
-        dist_course_combos = (
-            best_times[best_times["swimmer_id"] == sid][["distance", "course"]]
+        stroke_bests_map = best_lookup.get(sid, {})
+
+        # One API call per (stroke, distance, course) event
+        event_combos = (
+            best_times[best_times["swimmer_id"] == sid][["stroke", "distance", "course"]]
             .drop_duplicates()
             .to_dict("records")
         )
 
-        stroke_bests_map = best_lookup.get(sid, {})
-
         print(f"\n  [{i:>3}/{len(swimmers)}] {name} ({gender}) "
-              f"— {len(dist_course_combos)} distance/course combos")
+              f"— {len(event_combos)} events")
 
-        for combo in dist_course_combos:
+        for combo in event_combos:
+            stroke   = combo["stroke"]
             distance = combo["distance"]
             course   = combo["course"]
             key      = (distance, course)
@@ -323,10 +436,9 @@ def main():
             stroke_bests = stroke_bests_map.get(key, {})
             stroke_list  = list(stroke_bests.keys())
 
-            label = f"{distance} {'/'.join(stroke_list)} {course}"
-            print(f"    {label}...", end="", flush=True)
+            print(f"    {distance} {stroke} {course}...", end="", flush=True)
 
-            entries = get_swims_for_distance_course(str(sid), distance, course)
+            entries = get_swims_for_event(str(sid), stroke, distance, course)
             total_api_calls += 1
 
             # Deduplicate entries by swim ID
@@ -342,19 +454,55 @@ def main():
                     seen_ids.add(eid)
                 unique_entries.append(e)
 
-            count = 0
+            count   = 0
+            skipped = 0
             for entry in unique_entries:
                 swim_time = str(entry.get("eventtime", "")).strip()
                 if not swim_time or swim_time == "None":
                     continue
 
-                # Assign stroke via time-matching against best times
-                if len(stroke_bests) == 1:
-                    stroke = stroke_list[0]
+                # Drop DQ / NS / scratch — legal=False or timecode set
+                if entry.get("legal") is False:
+                    continue
+                if entry.get("timecode"):
+                    continue
+
+                # Filter by course using the eventcourse field — drop SCM and unknowns.
+                raw_course_code = entry.get("eventcourse")
+                if raw_course_code is not None:
+                    entry_course = API_COURSE_TO_NAME.get(str(raw_course_code).upper())
+                    if entry_course not in TRACKED_COURSES:
+                        continue  # SCM or unknown — discard
                 else:
-                    stroke = assign_stroke(swim_time, stroke_bests)
-                    if stroke is None:
-                        continue  # can't assign — skip
+                    entry_course = course  # field absent; trust the query
+
+                # Assign stroke directly from eventstroke field.
+                # No heuristic needed — the API tags each entry with its actual stroke.
+                raw_stroke_code = entry.get("eventstroke")
+                if raw_stroke_code is not None:
+                    entry_stroke = API_STROKE_TO_NAME.get(str(raw_stroke_code))
+                    if entry_stroke is None:
+                        continue  # unrecognised stroke code — skip
+                    confidence = "high"
+                else:
+                    # Fallback: heuristic if field absent
+                    entry_stroke, margin = assign_stroke(swim_time, {stroke: stroke_bests[stroke]} if stroke in stroke_bests else stroke_bests)
+                    if entry_stroke is None:
+                        continue
+                    if len(stroke_bests) > 1 and margin < STROKE_SKIP_THRESHOLD:
+                        skipped += 1
+                        continue
+                    confidence = "high" if (len(stroke_bests) == 1 or margin >= STROKE_FLAG_THRESHOLD) else "low"
+
+                # Validate time against world record bounds
+                swim_secs = time_to_seconds(swim_time)
+                if swim_secs is None or swim_secs <= 0:
+                    continue
+                valid, reason = validate_time(swim_secs, stroke, distance, entry_course)
+                if not valid:
+                    print(f"\n  [SKIP] {name} {distance} {entry_stroke} {entry_course} "
+                          f"{swim_time} on {entry.get('dateofswim','?')} — {reason}")
+                    continue
 
                 split_data  = entry.get("split", {})
                 splits_list = split_data.get("normalized_splittimes", []) if split_data else []
@@ -365,8 +513,8 @@ def main():
                     "gender":     gender,
                     "swimmer_id": sid,
                     "distance":   distance,
-                    "stroke":     stroke,
-                    "course":     course,
+                    "stroke":     entry_stroke,
+                    "course":     entry_course,
                     "time":       swim_time,
                     "meet":       str(entry.get("name", "") or entry.get("meet_name", "")).strip(),
                     "date":       str(entry.get("dateofswim", "")).strip(),
@@ -374,15 +522,22 @@ def main():
                     "heat":       entry.get("heat", ""),
                     "lane":       entry.get("lane", ""),
                     "splits":     splits,
+                    "confidence": confidence,
                 })
                 count += 1
 
-            print(f" {count} swims" if count else " no data")
+            total_skipped += skipped
+            suffix = f" {count} swims"
+            if skipped:
+                suffix += f" ({skipped} skipped — ambiguous)"
+            print(suffix if count else " no data")
 
             time.sleep(1.2)
 
     print(f"\n{'─' * 55}")
-    print(f"  API calls made: {total_api_calls}")
+    print(f"  API calls made:    {total_api_calls}")
+    print(f"  Records skipped:   {total_skipped} (stroke margin < {STROKE_SKIP_THRESHOLD}s)")
+    print(f"  Confidence thresholds: skip <{STROKE_SKIP_THRESHOLD}s | flag <{STROKE_FLAG_THRESHOLD}s")
 
     if all_records:
         print(f"\n💾 Saving output...")

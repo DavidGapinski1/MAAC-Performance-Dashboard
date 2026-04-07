@@ -31,9 +31,11 @@ Usage:
     python maac_scraper.py
 """
 
+import sys
 import os
 import time
 import pandas as pd
+sys.stdout.reconfigure(encoding="utf-8")
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from curl_cffi import requests

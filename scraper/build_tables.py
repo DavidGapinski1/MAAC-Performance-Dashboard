@@ -35,8 +35,10 @@ Usage:
     python build_tables.py
 """
 
+import sys
 import os
 import pandas as pd
+sys.stdout.reconfigure(encoding="utf-8")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
